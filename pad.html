@@ -5,8 +5,437 @@
 <title>AOG Watch Party · PAD</title>
 <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
 <meta name="robots" content="noindex">
-<script src="config.js"></script>
+<script src="firebase-config.js"></script>
 <script>window.BOOT=(function(){var q=new URLSearchParams(location.search),t=(q.get('team')||'').toUpperCase(),c={"event":"AOG Watch Party · 11.10.2026","duration":30,"leadMs":6000,"holdMs":5000,"teams":{"SGP":{"code":"SGP","name":"SAIGON PHANTOM"},"FPT":{"code":"FPT","name":"FPT X FLASH"}}};if(!c.teams[t]){document.addEventListener('DOMContentLoaded',function(){document.body.innerHTML='<div style="position:fixed;inset:0;display:grid;place-items:center;padding:24px;text-align:center;background:#0c0b2e;color:#fff;font:700 20px/1.5 sans-serif">Link pad thiếu team=SGP hoặc team=FPT – mở lại đúng link BTC cung cấp.</div>';});}return {page:'pad',cfg:c,team:t,key:q.get('k')||''};})();</script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-auth-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.12.2/firebase-database-compat.js"></script>
+<script>
+/* =====================================================================================
+ *  AOG WATCH PARTY · "server" chạy trên Firebase Realtime Database (không cần Cloud Functions)
+ *  -----------------------------------------------------------------------------------
+ *  Giữ NGUYÊN giao diện gọi hàm như bản Apps Script: api_poll / api_sync / api_admin trả về
+ *  cùng một dạng "view" → Tv/Pad/Admin không phải viết lại. Dữ liệu đồng bộ thời gian thực
+ *  (WebSocket) thay vì poll HTTP → không còn lỗi 503 / treo / nhiều tài khoản Google.
+ *
+ *  Quyền ghi được kiểm tra bằng Security Rules (firebase/database.rules.json):
+ *   • TV: chỉ đọc, không cần đăng nhập.
+ *   • Pad: đăng nhập ẩn danh + khóa k trong link (k so khớp /secret/keys, khóa không ai đọc được).
+ *   • Admin: đăng nhập ẩn danh + PIN (so khớp /secret/pin).
+ *  Các bước "server" (bắt đầu lượt, chốt kết quả, trao quà, về màn chờ) do pad/admin thực hiện
+ *  bằng transaction → an toàn khi nhiều máy cùng làm, chỉ 1 máy thắng.
+ * ===================================================================================== */
+(function (root) {
+  'use strict';
+  var BASE_K = {
+    LEAD_MS: 6000,        // SẴN SÀNG + 3-2-1
+    GRACE_MS: 3500,       // chờ điểm cuối sau khi hết giờ
+    HOLD_MS: 5000,        // hiện kết quả bao lâu rồi tự về màn chờ
+    READY_TTL: 6000,      // "sẵn sàng" hết hạn nếu pad mất tín hiệu
+    MAX_TPS: 25,          // trần tap/giây
+    DURATION: 30
+  };
+  var TEAMS = ['SGP', 'FPT'];
+
+  function createApi(firebase, opts) {
+    opts = opts || {};
+    var K = Object.assign({}, BASE_K, opts.K || {});
+    var page = opts.page || 'tv', myTeam = opts.team || '', myKey = opts.key || '';
+    var app = firebase.initializeApp(opts.config, opts.appName || undefined);
+    var db = app.database(), auth = app.auth ? app.auth() : null;
+    var TS = firebase.database.ServerValue.TIMESTAMP;
+    var S = { state: null, settings: null, stats: null, ready: {}, dev: {}, scores: {}, scoresRid: null, meta: null, prizes: null,
+      offset: 0, connected: true, discAt: 0, loaded: 0 };
+    var role = null, uid = null, padErr = '', authP = null;
+    var lastScore = {}, lastDevAt = 0, lastReady = null, lastReadyAt = 0, tries = {};
+
+    function now() { return Date.now() + S.offset; }
+    function ref(p) { return db.ref(p); }
+    function emptyState() { return { phase: 'IDLE', seq: 0, roundNo: 0, roundId: '' }; }
+    function emptyStats() { return { rounds: 0, winsSGP: 0, winsFPT: 0, draws: 0, tapsSGP: 0, tapsFPT: 0, since: Date.now() }; }
+    function defSettings() { return { auto: true, practice: false, duration: K.DURATION }; }
+    function throttle(key, ms) { var t = Date.now(); if (tries[key] && t - tries[key] < ms) return false; tries[key] = t; return true; }
+
+    /* ---------- lắng nghe dữ liệu ---------- */
+    var readyP = new Promise(function (resolve) {
+      var need = { state: 0, settings: 0, stats: 0 };
+      function mark(k) { if (!need[k]) { need[k] = 1; S.loaded++; if (S.loaded >= 3) resolve(); } }
+      ref('.info/serverTimeOffset').on('value', function (s) { S.offset = s.val() || 0; });
+      ref('.info/connected').on('value', function (s) { var c = !!s.val(); if (!c && S.connected) S.discAt = Date.now(); S.connected = c; });
+      ref('state').on('value', function (s) { S.state = s.val() || emptyState(); watchScores(); mark('state'); });
+      ref('settings').on('value', function (s) { S.settings = Object.assign(defSettings(), s.val() || {}); mark('settings'); });
+      ref('stats').on('value', function (s) { S.stats = Object.assign(emptyStats(), s.val() || {}); mark('stats'); });
+      ref('ready').on('value', function (s) { S.ready = s.val() || {}; });
+      ref('dev').on('value', function (s) { S.dev = s.val() || {}; });
+      ref('meta').on('value', function (s) { S.meta = s.val() || {}; });
+      // giữ cache cho transaction quà (transaction chạy trên dữ liệu cục bộ trước – thiếu cache sẽ tưởng là 'không có quà')
+      ref('prizes').on('value', function (s) { S.prizes = s.val() || {}; });
+      setTimeout(resolve, 8000);    // không chặn mãi nếu mạng chậm
+    });
+    function watchScores() {
+      var rid = (S.state && S.state.roundId) || '';
+      if (rid === S.scoresRid) return;
+      if (S.scoresRid) ref('scores/' + S.scoresRid).off();
+      S.scoresRid = rid; S.scores = {};
+      if (rid) ref('scores/' + rid).on('value', function (s) { if (S.scoresRid === rid) S.scores = s.val() || {}; });
+    }
+
+    /* ---------- đăng nhập (pad / admin) ---------- */
+    function signIn() {
+      if (!auth) return Promise.reject(new Error('Không có Firebase Auth'));
+      if (!authP) authP = (auth.currentUser ? Promise.resolve({ user: auth.currentUser }) : auth.signInAnonymously())
+        .then(function (c) { uid = (c && c.user ? c.user.uid : auth.currentUser.uid); return uid; })
+        .catch(function (e) { authP = null; throw e; });
+      return authP;
+    }
+    var padReady = null;
+    function ensurePad() {
+      if (role === 'pad') return Promise.resolve();
+      if (padErr) return Promise.reject(new Error(padErr));
+      if (!padReady) padReady = signIn().then(function () {
+        return ref('padAuth/' + uid).set({ team: myTeam, k: myKey, at: TS });
+      }).then(function () {
+        role = 'pad';
+        ref('dev/' + myTeam).onDisconnect().remove();
+      }).catch(function (e) { padReady = null; if (isDenied(e)) padErr = 'key'; throw e; });
+      return padReady;
+    }
+    function isDenied(e) { return /permission|PERMISSION_DENIED/i.test(String(e && (e.code || e.message || e))); }
+    function canWrite() { return role === 'pad' || role === 'admin'; }
+
+    /* ---------- view (cùng dạng với Apps Script view_) ---------- */
+    function readyMap(st, t) {
+      var out = { SGP: false, FPT: false };
+      if (st.phase === 'ROUND') return out;
+      TEAMS.forEach(function (k) { var d = S.ready[k]; out[k] = !!(d && d.seq === (st.seq || 0) && t - (d.t || 0) < K.READY_TTL); });
+      return out;
+    }
+    function view() {
+      var s = S.state || emptyState(), t = now(), stt = S.settings || defSettings();
+      var phase = s.phase || 'IDLE';
+      if (phase === 'RESULT' && s.result && t >= s.result.at + K.HOLD_MS) { phase = 'IDLE'; if (canWrite()) backToIdle(s.roundId); }
+      if (phase === 'ROUND' && t >= s.endAt) maybeFinalize(s, t);
+      var st = {
+        v: 0, seq: s.seq || 0, phase: phase, roundId: s.roundId || '', roundNo: s.roundNo || 0, practice: !!s.practice,
+        startAt: s.startAt || 0, endAt: s.endAt || 0, duration: s.duration || stt.duration || K.DURATION,
+        result: phase === 'RESULT' ? s.result : null,
+        lv: phase === 'IDLE' && s.result && s.result.counted && !s.result.voided ? (s.roundNo || 0) : 0
+      };
+      var dev = {};
+      TEAMS.forEach(function (k) { var d = S.dev[k]; dev[k] = d ? { age: Math.max(0, t - (d.t || 0)), b: d.b == null ? -1 : d.b, c: d.c ? 1 : 0 } : null; });
+      var out = { now: t, st: st, stats: S.stats || emptyStats(), set: stt, rd: readyMap(st, t), dev: dev, sc: { SGP: 0, FPT: 0 }, fin: { SGP: false, FPT: false } };
+      if (phase === 'ROUND') {
+        TEAMS.forEach(function (k) { var x = S.scores[k] || {}; out.sc[k] = x.n || 0; out.fin[k] = !!x.fin; });
+      } else if (phase === 'RESULT' && s.result) {
+        out.sc = { SGP: s.result.SGP, FPT: s.result.FPT }; out.fin = { SGP: true, FPT: true };
+      }
+      return out;
+    }
+
+    /* ---------- các bước "server" bằng transaction ---------- */
+    function startRound(practice, duration, readySeq, manual) {
+      var d = Math.max(5, Math.min(120, Math.round(duration || K.DURATION)));
+      var res = { ok: false, error: '' };
+      return ref('state').transaction(function (cur) {
+        cur = cur || emptyState();
+        res.error = '';
+        if (cur.phase === 'ROUND') { res.error = 'Đang có lượt chơi'; return; }
+        var heldResult = cur.phase === 'RESULT' && cur.result && now() < cur.result.at + K.HOLD_MS;
+        if (manual && heldResult) { res.error = 'Bấm "Lượt tiếp theo" trước'; return; }
+        if (readySeq !== undefined && (cur.seq || 0) !== readySeq) { res.error = 'stale'; return; }
+        var t = now(), seq = (cur.seq || 0) + 1;
+        return { seq: seq, phase: 'ROUND', roundNo: seq, roundId: 'R' + seq + '-' + t.toString(36), practice: !!practice,
+          startAt: t + K.LEAD_MS, duration: d, endAt: t + K.LEAD_MS + d * 1000, result: null };
+      }).then(function (r) { res.ok = !!(r && r.committed); if (!res.ok && !res.error) res.error = 'Không bắt đầu được'; return res; });
+    }
+
+    function maybeFinalize(s, t) {
+      if (!canWrite()) return;
+      var a = (S.scores.SGP || {}), b = (S.scores.FPT || {});
+      var bothFin = !!(a.fin && b.fin) && S.scoresRid === s.roundId;
+      if (!bothFin && t < s.endAt + K.GRACE_MS) return;
+      if (!throttle('fin', 900)) return;
+      finalize(s.roundId);
+    }
+    function finalize(rid) {
+      // đọc điểm mới nhất từ server rồi chốt bằng transaction (chỉ 1 máy thành công)
+      return ref('scores/' + rid).once('value').then(function (snap) {
+        var sc = snap.val() || {}, A = (sc.SGP && sc.SGP.n) || 0, B = (sc.FPT && sc.FPT.n) || 0;
+        var winner = A > B ? 'SGP' : B > A ? 'FPT' : 'DRAW', result = null;
+        return ref('state').transaction(function (cur) {
+          if (!cur || cur.phase !== 'ROUND' || cur.roundId !== rid) return;
+          var counted = !cur.practice;
+          result = { SGP: A, FPT: B, winner: winner, margin: Math.abs(A - B), counted: counted, voided: false, at: now(),
+            prize: null, prizeNote: counted && winner !== 'DRAW' ? 'pending' : '' };
+          cur.phase = 'RESULT'; cur.result = result;
+          return cur;
+        }).then(function (r) {
+          if (!r || !r.committed) return;
+          var st = r.snapshot.val();
+          return afterFinalize(st);
+        });
+      }).catch(function () {});
+    }
+    function afterFinalize(st) {
+      var r = st.result, jobs = [];
+      if (r.counted) jobs.push(ref('stats').transaction(function (x) {
+        x = Object.assign(emptyStats(), x || {});
+        x.rounds++; x.tapsSGP += r.SGP; x.tapsFPT += r.FPT;
+        if (r.winner === 'SGP') x.winsSGP++; else if (r.winner === 'FPT') x.winsFPT++; else x.draws++;
+        return x;
+      }));
+      var logRef = ref('log').push();
+      jobs.push(logRef.set(logRow(st, 'Hoàn thành', r.SGP, r.FPT, r.winner, '')));
+      jobs.push(ref('state/result/logKey').set(logRef.key));
+      return Promise.all(jobs).then(function () { if (r.prizeNote === 'pending') return awardPrize(st, logRef.key); });
+    }
+    function logRow(st, status, a, b, winner, note) {
+      return { no: st.roundNo || 0, at: st.startAt || now(), sgp: a, fpt: b,
+        result: winner === 'SGP' ? 'SGP thắng' : winner === 'FPT' ? 'FPT thắng' : winner === 'DRAW' ? 'Hòa' : '—',
+        margin: Math.abs(a - b), duration: st.duration || 0, type: st.practice ? 'Chơi thử' : 'Chính thức', status: status, rid: st.roundId || '', note: note || '' };
+    }
+    function awardPrize(st, logKey) {
+      var picked = null, total = 0, any = false;
+      return ref('prizes').transaction(function (list) {
+        picked = null; any = false;
+        if (!list) return;                             // không có quà
+        var avail = [];
+        Object.keys(list).forEach(function (id) { any = true; var p = list[id]; if (p && p.qty > 0 && p.weight > 0) avail.push(id); });
+        if (!avail.length) return;                     // hết quà → hủy transaction
+        total = 0; avail.forEach(function (id) { total += list[id].weight; });
+        var x = Math.random() * total, id = avail[avail.length - 1];
+        for (var i = 0; i < avail.length; i++) { x -= list[avail[i]].weight; if (x < 0) { id = avail[i]; break; } }
+        list[id].qty -= 1; list[id].given = (list[id].given || 0) + 1;
+        picked = { id: id, name: list[id].name, left: list[id].qty };
+        return list;
+      }).then(function (r) {
+        var upd = {};
+        if (r && r.committed && picked) {
+          var pl = ref('prizeLog').push();
+          upd['prizeLog/' + pl.key] = { at: now(), no: st.roundNo, team: st.result.winner, id: picked.id, name: picked.name, left: picked.left, rid: st.roundId, st: 'Đã trao' };
+          upd['state/result/prize'] = { id: picked.id, name: picked.name };
+          upd['state/result/prizeNote'] = 'ok';
+          upd['state/result/prizeLogKey'] = pl.key;
+          if (logKey) upd['log/' + logKey + '/note'] = 'Quà: ' + picked.name;
+        } else {
+          upd['state/result/prizeNote'] = any ? 'out' : 'none';
+        }
+        return ref().update(upd);
+      });
+    }
+    function backToIdle(rid) {
+      if (!throttle('idle', 1500)) return;
+      ref('state').transaction(function (cur) {
+        if (!cur || cur.phase !== 'RESULT' || cur.roundId !== rid || !cur.result || now() < cur.result.at + K.HOLD_MS) return;
+        cur.phase = 'IDLE'; return cur;
+      }).catch(function () {});
+    }
+
+    /* ---------- API: poll (TV / admin) ---------- */
+    function api_poll() { return Promise.resolve(view()); }
+
+    /* ---------- API: sync (pad) ---------- */
+    function api_sync(p) {
+      p = p || {};
+      return ensurePad().then(function () {
+        var t = now(), s = S.state || emptyState(), team = myTeam, writes = [];
+        if (t - lastDevAt > 2500) { lastDevAt = t; writes.push(ref('dev/' + team).set({ t: TS, b: p.b == null ? -1 : p.b, c: p.c ? 1 : 0 })); }
+        var v0 = view(), effPhase = v0.st.phase;
+        // nút SẴN SÀNG
+        if (effPhase !== 'ROUND') {
+          var want = p.rdy && Number(p.rseq) === (s.seq || 0);
+          if (want) {
+            if (lastReady !== s.seq || Date.now() - lastReadyAt > 2000) { lastReady = s.seq; lastReadyAt = Date.now(); writes.push(ref('ready/' + team).set({ seq: s.seq || 0, t: TS })); }
+            var other = team === 'SGP' ? 'FPT' : 'SGP', od = S.ready[other];
+            if ((S.settings || {}).auto !== false && od && od.seq === (s.seq || 0) && t - (od.t || 0) < K.READY_TTL && throttle('auto', 800)) {
+              var stt = S.settings || defSettings();
+              writes.push(startRound(stt.practice, stt.duration, s.seq || 0, false));
+            }
+          } else if (lastReady !== null) { lastReady = null; writes.push(ref('ready/' + team).remove()); }
+        }
+        // điểm
+        var me = { n: 0, fin: false, rid: s.roundId || '' };
+        if (s.phase === 'ROUND' && p.roundId === s.roundId && t < s.endAt + K.GRACE_MS) {
+          var prev = S.scores[team] || {}, pn = prev.n || 0;
+          var elapsed = Math.max(0, (Math.min(t, s.endAt) - s.startAt) / 1000) + 2;
+          var cap = Math.ceil(K.MAX_TPS * elapsed);
+          var early = t < s.startAt - 500;
+          var n = early ? pn : Math.min(Math.max(pn, Math.floor(Number(p.count) || 0)), cap);
+          var fin = !!prev.fin || (!!p.fin && t >= s.endAt - 300);
+          me = { n: n, fin: fin, rid: s.roundId };
+          var key = s.roundId, last = lastScore[key];
+          if (!early && (!last || last.n !== n || last.fin !== fin)) { lastScore = {}; lastScore[key] = { n: n, fin: fin }; writes.push(ref('scores/' + key + '/' + team).set({ n: n, fin: fin, t: TS })); }
+        } else if (s.phase === 'RESULT' && s.result && p.roundId === s.roundId) {
+          me = { n: s.result[team], fin: true, rid: s.roundId };
+        }
+        Promise.all(writes).catch(function () {});     // ghi nền; không chặn giao diện
+        var v = view(); v.me = me; return v;
+      }, function (e) {
+        if (padErr) return { error: padErr };
+        throw e;
+      });
+    }
+
+    /* ---------- API: admin ---------- */
+    var adminReady = null;
+    function ensureAdmin(pin) {
+      if (role === 'admin') return Promise.resolve(true);
+      if (!adminReady) adminReady = signIn().then(function () {
+        return ref('adminAuth/' + uid).set({ pin: String(pin || ''), at: TS });
+      }).then(function () { role = 'admin'; return true; }, function (e) { adminReady = null; if (isDenied(e)) return false; throw e; });
+      return adminReady;
+    }
+    function ok(extra) { var r = Object.assign({ ok: true }, extra || {}); r.view = view(); return r; }
+    function fail(msg) { var r = { ok: false, error: msg }; r.view = view(); return r; }
+
+    function api_admin(a) {
+      a = a || {};
+      var act = a.action;
+      if (act === 'setup') return setup(a);
+      return readyP.then(function () {
+        if (!(S.meta && S.meta.inited)) return { ok: false, error: 'Hệ thống chưa khởi tạo', needSetup: true };
+        return ensureAdmin(a.pin).then(function (okPin) {
+          if (!okPin) return { ok: false, error: 'Sai PIN' };
+          return adminAct(act, a);
+        });
+      }).catch(function (e) { return { ok: false, error: String(e && e.message || e) }; });
+    }
+    function setup(a) {
+      var pin = String(a.pin || '').trim();
+      if (pin.length < 4) return Promise.resolve({ ok: false, error: 'PIN tối thiểu 4 ký tự' });
+      function rnd() { var s = ''; var c = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; for (var i = 0; i < 4; i++) s += c[Math.floor(Math.random() * c.length)]; return s; }
+      var keys = { SGP: 'sgp-' + rnd(), FPT: 'fpt-' + rnd() };
+      return signIn().then(function () {
+        return ref('secret').set({ pin: pin, keys: keys });
+      }).then(function () { return ref('meta').set({ inited: true, at: TS }); })
+        .then(function () { return ref('adminAuth/' + uid).set({ pin: pin, at: TS }); })
+        .then(function () { role = 'admin'; return { ok: true, keys: keys }; })
+        .catch(function (e) { return { ok: false, error: isDenied(e) ? 'Hệ thống đã được khởi tạo trước đó' : String(e.message || e) }; });
+    }
+    function adminAct(act, a) {
+      var stt = S.settings || defSettings(), s = S.state || emptyState();
+      switch (act) {
+        case 'auth': return ok();
+        case 'start': return startRound(a.practice !== undefined ? !!a.practice : stt.practice, a.duration !== undefined ? Number(a.duration) : stt.duration, undefined, true)
+          .then(function (r) { return r.ok ? ok() : fail(r.error); });
+        case 'settings': {
+          var x = {};
+          if (a.auto !== undefined) x.auto = !!a.auto;
+          if (a.practice !== undefined) x.practice = !!a.practice;
+          if (a.duration !== undefined) x.duration = Math.max(5, Math.min(120, Math.round(Number(a.duration) || stt.duration)));
+          return ref('settings').update(x).then(function () { return ok({ set: Object.assign({}, stt, x) }); });
+        }
+        case 'cancel': {
+          var snapS = null;
+          return ref('scores/' + s.roundId).once('value').then(function (sn) {
+            var sc = sn.val() || {};
+            return ref('state').transaction(function (cur) {
+              if (!cur || cur.phase !== 'ROUND') return;
+              snapS = { st: JSON.parse(JSON.stringify(cur)), a: (sc.SGP && sc.SGP.n) || 0, b: (sc.FPT && sc.FPT.n) || 0 };
+              cur.phase = 'IDLE'; cur.result = null; return cur;
+            });
+          }).then(function (r) {
+            if (!r.committed) return fail('Không có lượt đang chạy');
+            return ref('log').push(logRow(snapS.st, 'Hủy', snapS.a, snapS.b, null, '')).then(function () { return ok(); });
+          });
+        }
+        case 'next': return ref('state').transaction(function (cur) {
+          if (!cur || cur.phase !== 'RESULT') return; cur.phase = 'IDLE'; return cur;
+        }).then(function () { return ok(); });
+        case 'void': return voidLast().then(function (r) { return r === true ? ok() : fail(r); });
+        case 'resetStats': return ref('stats').set(emptyStats()).then(function () { return ok(); });
+        case 'recount': return ref('log').once('value').then(function (sn) {
+          var st = emptyStats();
+          sn.forEach(function (c) { var r = c.val(); if (r.type !== 'Chính thức' || r.status !== 'Hoàn thành') return;
+            st.rounds++; st.tapsSGP += r.sgp || 0; st.tapsFPT += r.fpt || 0;
+            if (r.result === 'SGP thắng') st.winsSGP++; else if (r.result === 'FPT thắng') st.winsFPT++; else st.draws++; });
+          return ref('stats').set(st).then(function () { return ok(); });
+        });
+        case 'history': return ref('log').orderByKey().limitToLast(12).once('value').then(function (sn) {
+          var rows = []; sn.forEach(function (c) { var r = c.val(); rows.push({ no: r.no, at: r.at, sgp: r.sgp, fpt: r.fpt, result: r.result, type: r.type, status: r.status }); });
+          return { ok: true, rows: rows.reverse() };
+        });
+        case 'links': return ref('secret/keys').once('value').then(function (sn) {
+          var k = sn.val() || {}, base = (root.location ? root.location.href.replace(/[?#].*$/, '').replace(/[^\/]*$/, '') : '');
+          return { ok: true, links: { tv: base + 'tv.html', admin: base + 'admin.html',
+            padSGP: base + 'pad.html?team=SGP&k=' + encodeURIComponent(k.SGP || ''), padFPT: base + 'pad.html?team=FPT&k=' + encodeURIComponent(k.FPT || ''),
+            sheet: opts.sheetUrl || '', warn: '', keys: k } };
+        });
+        case 'prizes': return prizesResp();
+        case 'prizeSave': {
+          var name = String(a.name == null ? '' : a.name).replace(/\s+/g, ' ').trim().slice(0, 60);
+          if (!name) return Promise.resolve({ ok: false, error: 'Tên quà không được để trống' });
+          var qty = Math.max(0, Math.min(99999, Math.round(Number(a.qty) || 0)));
+          var w = Math.max(0, Math.min(100000, Math.round((a.weight === undefined || a.weight === '' ? 1 : Number(a.weight) || 0) * 100) / 100));
+          var id = a.id || ('P' + Date.now().toString(36) + Math.floor(Math.random() * 1296).toString(36));
+          var refP = ref('prizes/' + id);
+          return refP.transaction(function (cur) {
+            if (cur) { cur.name = name; cur.qty = qty; cur.weight = w; return cur; }
+            return { name: name, qty: qty, weight: w, given: 0, created: Date.now() };
+          }).then(prizesResp);
+        }
+        case 'prizeDel': return ref('prizes/' + String(a.id || '')).remove().then(prizesResp);
+        case 'flush': return Promise.resolve(ok({ flushed: 0 }));
+        default: return Promise.resolve(fail('Lệnh không hợp lệ'));
+      }
+    }
+    function prizesResp() {
+      return Promise.all([ref('prizes').once('value'), ref('prizeLog').orderByKey().limitToLast(40).once('value')]).then(function (x) {
+        var items = [], log = [];
+        x[0].forEach(function (c) { var p = c.val(); items.push({ id: c.key, name: p.name, qty: p.qty, weight: p.weight, given: p.given || 0, created: p.created || 0 }); });
+        items.sort(function (p, q) { return (p.created || 0) - (q.created || 0); });
+        x[1].forEach(function (c) { log.push(c.val()); });
+        return { ok: true, items: items, log: log.reverse() };
+      });
+    }
+    function voidLast() {
+      var s = S.state || emptyState(), r = s.result, rid = s.roundId;
+      if (s.phase === 'ROUND' || !r) return Promise.resolve('Không có kết quả lượt vừa xong để loại bỏ');
+      if (r.voided) return Promise.resolve(true);
+      var snap = null;
+      return ref('state').transaction(function (cur) {
+        if (!cur || cur.phase === 'ROUND' || !cur.result || cur.roundId !== rid || cur.result.voided) return;
+        cur.result.voided = true; snap = JSON.parse(JSON.stringify(cur.result)); return cur;
+      }).then(function (t) {
+        if (!t.committed || !snap) return 'Không loại bỏ được';
+        var jobs = [];
+        if (snap.counted) jobs.push(ref('stats').transaction(function (x) {
+          x = Object.assign(emptyStats(), x || {});
+          x.rounds = Math.max(0, x.rounds - 1); x.tapsSGP = Math.max(0, x.tapsSGP - snap.SGP); x.tapsFPT = Math.max(0, x.tapsFPT - snap.FPT);
+          if (snap.winner === 'SGP') x.winsSGP = Math.max(0, x.winsSGP - 1); else if (snap.winner === 'FPT') x.winsFPT = Math.max(0, x.winsFPT - 1); else x.draws = Math.max(0, x.draws - 1);
+          return x;
+        }));
+        if (snap.logKey) jobs.push(ref('log/' + snap.logKey + '/status').set('Loại bỏ'));
+        if (snap.prize && snap.prize.id) {
+          jobs.push(ref('prizes/' + snap.prize.id).transaction(function (p) { if (!p) return; p.qty = (p.qty || 0) + 1; p.given = Math.max(0, (p.given || 0) - 1); return p; }));
+          if (snap.prizeLogKey) jobs.push(ref('prizeLog/' + snap.prizeLogKey + '/st').set('Hoàn lại'));
+        }
+        return Promise.all(jobs).then(function () { return true; });
+      });
+    }
+
+    /* ---------- cổng gọi chung (thay google.script.run) ---------- */
+    function call(fn, arg) {
+      return readyP.then(function () {
+        if (!S.connected && S.discAt && Date.now() - S.discAt > 2500) throw new Error('offline');
+        if (fn === 'api_poll') return api_poll();
+        if (fn === 'api_sync') return api_sync(arg);
+        if (fn === 'api_admin') return api_admin(arg);
+        if (fn === 'api_cfg') return { teams: opts.teams };
+        throw new Error('Hàm không hợp lệ: ' + fn);
+      });
+    }
+    return { call: call, _S: S, _now: now, _view: view, K: K, ready: readyP, role: function () { return role; } };
+  }
+
+  root.AOGFirebase = { createApi: createApi, K: BASE_K };
+  // Tự khởi tạo trên trang thật
+  if (root.firebase && root.AOG_FIREBASE && root.BOOT) {
+    root.AOG_FB_API = createApi(root.firebase, { config: root.AOG_FIREBASE, sheetUrl: root.AOG_SHEET_URL || '', K: root.AOG_FB_K, page: root.BOOT.page, team: root.BOOT.team, key: root.BOOT.key, teams: root.BOOT.cfg && root.BOOT.cfg.teams });
+  }
+})(typeof window !== 'undefined' ? window : globalThis);
+
+</script>
 <link rel="stylesheet" href="assets.css">
 <style>
 /* ===== AOG W26 · Watch Party — tokens (theo bộ VI) ===== */
@@ -46,6 +475,12 @@ window.AOG = (function () {
   var API = window.AOG_API_URL || '';
   function rpc(fn, arg, timeoutMs) {
     timeoutMs = timeoutMs || 9000;
+    if (window.AOG_FB_API) {   // bản Firebase: dữ liệu thời gian thực, gọi hàm cục bộ (firebase/fb-core.js)
+      return new Promise(function (resolve, reject) {
+        var to = setTimeout(function () { reject(new Error('timeout')); }, timeoutMs);
+        window.AOG_FB_API.call(fn, arg).then(function (v) { clearTimeout(to); resolve(v); }, function (e) { clearTimeout(to); reject(e); });
+      });
+    }
     if (API) {
       var ctl = window.AbortController ? new AbortController() : null;
       var to = setTimeout(function () { if (ctl) ctl.abort(); }, timeoutMs);
