@@ -93,7 +93,7 @@
       if (role === 'pad') return Promise.resolve();
       if (padErr) return Promise.reject(new Error(padErr));
       if (!padReady) padReady = signIn().then(function () {
-        return ref('padAuth/' + uid).set({ team: myTeam, k: myKey, at: TS });
+        return ref('padAuth/' + uid + '/' + myTeam).set({ k: myKey, at: TS });
       }).then(function () {
         role = 'pad';
         ref('dev/' + myTeam).onDisconnect().remove();
