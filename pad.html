@@ -49,11 +49,10 @@ window.AOG = (function () {
     if (API) {
       var ctl = window.AbortController ? new AbortController() : null;
       var to = setTimeout(function () { if (ctl) ctl.abort(); }, timeoutMs);
-      return fetch(API, {
-        method: 'POST', body: JSON.stringify({ fn: fn, arg: arg === undefined ? null : arg }),
-        headers: { 'Content-Type': 'text/plain;charset=utf-8' }, credentials: 'omit', cache: 'no-store', redirect: 'follow',
-        signal: ctl ? ctl.signal : undefined
-      }).then(function (r) {
+      // GET (request "đơn giản": không preflight, không cookie). Với Web App ẩn danh, GET ổn định hơn POST.
+      var url = API + (API.indexOf('?') < 0 ? '?' : '&') + 'fn=' + encodeURIComponent(fn) +
+        (arg === undefined || arg === null ? '' : '&arg=' + encodeURIComponent(JSON.stringify(arg))) + '&_=' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+      return fetch(url, { method: 'GET', credentials: 'omit', cache: 'no-store', redirect: 'follow', signal: ctl ? ctl.signal : undefined }).then(function (r) {
         clearTimeout(to);
         if (!r.ok) throw new Error('HTTP ' + r.status);
         return r.json();
