@@ -50,6 +50,11 @@
     var lastScore = {}, lastDevAt = 0, lastReady = null, lastReadyAt = 0, tries = {};
 
     function now() { return Date.now() + S.offset; }
+    // Báo Apps Script chép ngay sang Google Sheet (không chặn game; lỗi thì trigger mỗi phút sẽ bù)
+    function pingSheet(delay) {
+      var u = opts.sheetSyncUrl; if (!u || typeof fetch !== 'function') return;
+      setTimeout(function () { try { fetch(u + (u.indexOf('?') < 0 ? '?' : '&') + 'fn=fbsync&_=' + Date.now(), { mode: 'no-cors', credentials: 'omit', cache: 'no-store' }).catch(function () {}); } catch (e) {} }, delay || 0);
+    }
     function ref(p) { return db.ref(p); }
     function emptyState() { return { phase: 'IDLE', seq: 0, roundNo: 0, roundId: '' }; }
     function emptyStats() { return { rounds: 0, winsSGP: 0, winsFPT: 0, draws: 0, tapsSGP: 0, tapsFPT: 0, since: Date.now() }; }
@@ -187,7 +192,7 @@
       var logRef = ref('log').push();
       jobs.push(logRef.set(logRow(st, 'Hoàn thành', r.SGP, r.FPT, r.winner, '')));
       jobs.push(ref('state/result/logKey').set(logRef.key));
-      return Promise.all(jobs).then(function () { if (r.prizeNote === 'pending') return awardPrize(st, logRef.key); });
+      return Promise.all(jobs).then(function () { if (r.prizeNote === 'pending') return awardPrize(st, logRef.key); }).then(function () { pingSheet(300); pingSheet(8000); });
     }
     function logRow(st, status, a, b, winner, note) {
       return { no: st.roundNo || 0, at: st.startAt || now(), sgp: a, fpt: b,
@@ -336,7 +341,7 @@
             });
           }).then(function (r) {
             if (!r.committed) return fail('Không có lượt đang chạy');
-            return ref('log').push(logRow(snapS.st, 'Hủy', snapS.a, snapS.b, null, '')).then(function () { return ok(); });
+            return ref('log').push(logRow(snapS.st, 'Hủy', snapS.a, snapS.b, null, '')).then(function () { pingSheet(300); return ok(); });
           });
         }
         case 'next': return ref('state').transaction(function (cur) {
@@ -410,7 +415,7 @@
           jobs.push(ref('prizes/' + snap.prize.id).transaction(function (p) { if (!p) return; p.qty = (p.qty || 0) + 1; p.given = Math.max(0, (p.given || 0) - 1); return p; }));
           if (snap.prizeLogKey) jobs.push(ref('prizeLog/' + snap.prizeLogKey + '/st').set('Hoàn lại'));
         }
-        return Promise.all(jobs).then(function () { return true; });
+        return Promise.all(jobs).then(function () { pingSheet(300); return true; });
       });
     }
 
@@ -431,7 +436,7 @@
   root.AOGFirebase = { createApi: createApi, K: BASE_K };
   // Tự khởi tạo trên trang thật
   if (root.firebase && root.AOG_FIREBASE && root.BOOT) {
-    root.AOG_FB_API = createApi(root.firebase, { config: root.AOG_FIREBASE, sheetUrl: root.AOG_SHEET_URL || '', K: root.AOG_FB_K, page: root.BOOT.page, team: root.BOOT.team, key: root.BOOT.key, teams: root.BOOT.cfg && root.BOOT.cfg.teams });
+    root.AOG_FB_API = createApi(root.firebase, { config: root.AOG_FIREBASE, sheetUrl: root.AOG_SHEET_URL || '', sheetSyncUrl: root.AOG_SHEET_SYNC_URL || '', K: root.AOG_FB_K, page: root.BOOT.page, team: root.BOOT.team, key: root.BOOT.key, teams: root.BOOT.cfg && root.BOOT.cfg.teams });
   }
 })(typeof window !== 'undefined' ? window : globalThis);
 

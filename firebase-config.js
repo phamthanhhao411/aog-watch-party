@@ -8,4 +8,6 @@ window.AOG_FIREBASE = {
   appId: "1:821816586633:web:92737609663bd4efc03158"
 };
 // (Tùy chọn) Link Google Sheet báo cáo để hiện trong trang Admin → Liên kết thiết bị
-window.AOG_SHEET_URL = '';
+window.AOG_SHEET_URL = 'https://docs.google.com/spreadsheets/d/1nRmN6s0gKsKalfLssdGkvtZZhy1IfS5aUKJl29Z2ybw/edit';
+// Web App Apps Script dùng để chép ngay kết quả sang Google Sheet sau mỗi lượt (fn=fbsync)
+window.AOG_SHEET_SYNC_URL = 'https://script.google.com/macros/s/AKfycby68hb5PWmAFfEerTlkA4jv8Q76UKw2C-Ref4dNfa6O1ADME5kJ3GVBE9k-M7r8o7yP/exec';
