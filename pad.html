@@ -1,0 +1,425 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<title>AOG Watch Party · PAD</title>
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="robots" content="noindex">
+<script src="config.js"></script>
+<script>window.BOOT=(function(){var q=new URLSearchParams(location.search),t=(q.get('team')||'').toUpperCase(),c={"event":"AOG Watch Party · 11.10.2026","duration":30,"leadMs":6000,"holdMs":5000,"teams":{"SGP":{"code":"SGP","name":"SAIGON PHANTOM"},"FPT":{"code":"FPT","name":"FPT X FLASH"}}};if(!c.teams[t]){document.addEventListener('DOMContentLoaded',function(){document.body.innerHTML='<div style="position:fixed;inset:0;display:grid;place-items:center;padding:24px;text-align:center;background:#0c0b2e;color:#fff;font:700 20px/1.5 sans-serif">Link pad thiếu team=SGP hoặc team=FPT – mở lại đúng link BTC cung cấp.</div>';});}return {page:'pad',cfg:c,team:t,key:q.get('k')||''};})();</script>
+<link rel="stylesheet" href="assets.css">
+<style>
+/* ===== AOG W26 · Watch Party — tokens (theo bộ VI) ===== */
+:root{
+  --ink:#05041a; --bg-0:#0b0a2c; --bg-1:#1b1a63; --bg-2:#393890;
+  --violet:#6562ff; --violet-deep:#4c4bac;
+  --white:#fff; --mute:#b9b8ee; --line:rgba(255,255,255,.14);
+  --sgp:#dfc989; --sgp-hi:#f1e4b3; --sgp-lo:#b8935a;
+  --fpt:#ff4a00; --fpt-hi:#ff7a3c; --fpt-lo:#e3262b;
+  --ok:#3ddc97; --warn:#ffb020; --bad:#ff4d4f;
+  --f-display:'AOG Era','AOG Grotesk',Impact,sans-serif;
+  --f-ui:'AOG Grotesk',system-ui,-apple-system,'Segoe UI',Roboto,Arial,sans-serif;
+  --f-label:'AOG Wide','AOG Grotesk',system-ui,sans-serif;
+  --safe-t:env(safe-area-inset-top,0px); --safe-b:env(safe-area-inset-bottom,0px);
+  --safe-l:env(safe-area-inset-left,0px); --safe-r:env(safe-area-inset-right,0px);
+}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+html,body{margin:0;height:100%;background:var(--bg-0);color:var(--white);font-family:var(--f-ui);font-weight:500;overscroll-behavior:none}
+button{font:inherit;color:inherit}
+.logo{background-position:center;background-repeat:no-repeat;background-size:contain}
+.sr-only{position:absolute;width:1px;height:1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap}
+.num{font-family:var(--f-ui);font-weight:900;font-variant-numeric:tabular-nums;letter-spacing:-.02em}
+.conn{position:fixed;z-index:50;left:50%;top:max(10px,var(--safe-t));transform:translateX(-50%);padding:8px 16px;background:var(--warn);color:#1a1200;font:900 13px/1 var(--f-label);letter-spacing:.06em;text-transform:uppercase;clip-path:polygon(10px 0,100% 0,calc(100% - 10px) 100%,0 100%);display:none}
+body.offline .conn{display:block}
+:focus-visible{outline:3px solid var(--violet);outline-offset:2px}
+@media (prefers-reduced-motion:reduce){*{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important}}
+</style>
+<script>
+/* ===== AOG · thư viện dùng chung: gọi server, đồng bộ giờ, vòng poll, giữ màn hình sáng ===== */
+window.AOG = (function () {
+  var BOOT = window.BOOT || {};
+  var CFG = BOOT.cfg || { duration: 30, leadMs: 5000, teams: { SGP: { code: 'SGP', name: 'SAIGON PHANTOM' }, FPT: { code: 'FPT', name: 'FPT X FLASH' } } };
+
+  /* --- gọi hàm server có timeout ---
+   *  • Trang chạy trên GitHub Pages (có window.AOG_API_URL): fetch POST tới Web App, không kèm cookie Google.
+   *  • Trang chạy trong Apps Script (HtmlService): google.script.run như cũ. */
+  var API = window.AOG_API_URL || '';
+  function rpc(fn, arg, timeoutMs) {
+    timeoutMs = timeoutMs || 9000;
+    if (API) {
+      var ctl = window.AbortController ? new AbortController() : null;
+      var to = setTimeout(function () { if (ctl) ctl.abort(); }, timeoutMs);
+      return fetch(API, {
+        method: 'POST', body: JSON.stringify({ fn: fn, arg: arg === undefined ? null : arg }),
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' }, credentials: 'omit', cache: 'no-store', redirect: 'follow',
+        signal: ctl ? ctl.signal : undefined
+      }).then(function (r) {
+        clearTimeout(to);
+        if (!r.ok) throw new Error('HTTP ' + r.status);
+        return r.json();
+      }, function (e) { clearTimeout(to); throw e; }).then(function (j) {
+        if (j && j.__rpcError) throw new Error(j.__rpcError);
+        return j;
+      });
+    }
+    return new Promise(function (resolve, reject) {
+      var done = false;
+      var to = setTimeout(function () { if (!done) { done = true; reject(new Error('timeout')); } }, timeoutMs);
+      try {
+        google.script.run
+          .withSuccessHandler(function (r) { if (done) return; done = true; clearTimeout(to); resolve(r); })
+          .withFailureHandler(function (e) { if (done) return; done = true; clearTimeout(to); reject(e); })[fn](arg);
+      } catch (e) { done = true; clearTimeout(to); reject(e); }
+    });
+  }
+
+  /* --- đồng hồ: ước lượng lệch giờ so với server (lấy mẫu có RTT nhỏ nhất) --- */
+  var clock = {
+    off: 0, rtt: 0, samples: [],
+    update: function (t0, t1, srv) {
+      var rtt = t1 - t0, off = srv - (t0 + t1) / 2;
+      this.samples.push({ rtt: rtt, off: off, at: t1 });
+      var cut = t1 - 40000;
+      this.samples = this.samples.filter(function (s) { return s.at >= cut; }).slice(-12);
+      var best = this.samples[0];
+      for (var i = 1; i < this.samples.length; i++) if (this.samples[i].rtt < best.rtt) best = this.samples[i];
+      this.off = best.off; this.rtt = best.rtt;
+    },
+    now: function () { return Date.now() + this.off; }
+  };
+
+  /* --- trạng thái mạng --- */
+  var online = true, listeners = [];
+  function setOnline(v) {
+    if (v === online) return;
+    online = v; document.body.classList.toggle('offline', !v);
+    listeners.forEach(function (f) { try { f(v); } catch (e) {} });
+  }
+
+  /* --- vòng poll: không chồng request, tự lùi khi lỗi, có kick() để chạy ngay --- */
+  function loop(fn, o) {
+    var timer = null, busy = false, stopped = false, kickReq = false, fails = 0, lastOk = Date.now();
+    function run() {
+      if (stopped || busy) return;
+      busy = true; clearTimeout(timer);
+      var t0 = Date.now(), ok = false;
+      Promise.resolve().then(fn).then(function (v) {
+        var t1 = Date.now();
+        if (!v || typeof v.now !== 'number') throw new Error('bad');
+        clock.update(t0, t1, v.now); lastOk = t1; fails = 0; ok = true; setOnline(true);
+        o.onView(v);
+      }).catch(function (e) {
+        fails++; if (Date.now() - lastOk > 3500) setOnline(false);
+        if (o.onError) o.onError(e);
+      }).then(function () {
+        busy = false;
+        var base = ok ? o.interval() : Math.min(2500, 250 * Math.pow(1.6, Math.min(fails, 6)));
+        var wait = kickReq ? 0 : Math.max(0, base - (Date.now() - t0));
+        kickReq = false;
+        timer = setTimeout(run, wait);
+      });
+    }
+    return {
+      start: run,
+      kick: function () { if (busy) kickReq = true; else { clearTimeout(timer); run(); } },
+      stop: function () { stopped = true; clearTimeout(timer); }
+    };
+  }
+
+  /* --- pha hiển thị suy ra từ trạng thái server + đồng hồ đã bù lệch --- */
+  function derive(v) {
+    if (!v) return { p: 'IDLE' };
+    var st = v.st;
+    if (st.phase === 'IDLE') return { p: 'IDLE' };
+    if (st.phase === 'RESULT') return { p: 'RESULT' };
+    var t = clock.now();
+    if (t < st.startAt) return { p: 'COUNT', ms: st.startAt - t };
+    if (t < st.endAt) return { p: 'RUN', ms: st.endAt - t };
+    return { p: 'END', ms: t - st.endAt };
+  }
+
+  /* --- giữ màn hình sáng: Wake Lock + video ẩn (dự phòng). Cài đặt hệ điều hành vẫn là lớp chính. --- */
+  var lock = null, vid = null;
+  function keepAwake() {
+    try { if (navigator.wakeLock && navigator.wakeLock.request) navigator.wakeLock.request('screen').then(function (l) { lock = l; }).catch(function () {}); } catch (e) {}
+    if (!vid) {
+      try {
+        var c = document.createElement('canvas'); c.width = c.height = 4;
+        var x = c.getContext('2d'), k = 0;
+        var v = document.createElement('video');
+        v.muted = true; v.loop = true; v.setAttribute('playsinline', ''); v.setAttribute('muted', '');
+        v.style.cssText = 'position:fixed;left:0;top:0;width:2px;height:2px;opacity:.02;pointer-events:none';
+        v.srcObject = c.captureStream(4);
+        document.body.appendChild(v); vid = v;
+        setInterval(function () { k ^= 1; x.fillStyle = k ? '#000' : '#020202'; x.fillRect(0, 0, 4, 4); }, 500);
+      } catch (e) { vid = {}; }
+    }
+    if (vid && vid.play) { try { var p = vid.play(); if (p && p.catch) p.catch(function () {}); } catch (e) {} }
+  }
+  document.addEventListener('visibilitychange', function () { if (!document.hidden) keepAwake(); });
+
+  function fullscreen() {
+    try { var d = document.documentElement; (d.requestFullscreen || d.webkitRequestFullscreen || function () {}).call(d); } catch (e) {}
+  }
+
+  function store(k, v) { try { if (v === undefined) return JSON.parse(localStorage.getItem('aog.' + k)); localStorage.setItem('aog.' + k, JSON.stringify(v)); } catch (e) { return null; } }
+  function $(s, r) { return (r || document).querySelector(s); }
+  function $$(s, r) { return Array.prototype.slice.call((r || document).querySelectorAll(s)); }
+  function p2(n) { return (n < 10 ? '0' : '') + n; }
+
+  return {
+    BOOT: BOOT, CFG: CFG, rpc: rpc, clock: clock, loop: loop, derive: derive, keepAwake: keepAwake, fullscreen: fullscreen,
+    store: store, $: $, $$: $$, p2: p2, setOnline: setOnline, isOnline: function () { return online; },
+    onOnline: function (f) { listeners.push(f); }
+  };
+})();
+</script>
+
+<style>
+/* ===================== PAD — điện thoại cố định tại trạm (dọc) ===================== */
+html,body{position:fixed;inset:0;width:100%;height:100%;overflow:hidden;touch-action:none;
+  -webkit-user-select:none;user-select:none;-webkit-touch-callout:none;cursor:pointer}
+.t-SGP{--c1:#f6ebc0;--c2:#dfc989;--c3:#b8935a;--on:#15130c;--rip:rgba(0,0,0,.16);--accent:var(--sgp);--glow:rgba(223,201,137,.55)}
+.t-FPT{--c1:#ff7a3c;--c2:#ff4a00;--c3:#e3262b;--on:#fff;--rip:rgba(255,255,255,.35);--accent:var(--fpt);--glow:rgba(255,74,0,.6)}
+#pad{position:fixed;inset:0;display:flex;flex-direction:column;gap:10px;
+  padding:calc(var(--safe-t) + 10px) calc(var(--safe-r) + 10px) calc(var(--safe-b) + 10px) calc(var(--safe-l) + 10px);
+  background:radial-gradient(120% 70% at 50% 0%,var(--glow),rgba(0,0,0,0) 60%),linear-gradient(180deg,#14133f,#07061c)}
+
+/* header */
+.hd{display:flex;align-items:center;gap:12px;height:clamp(54px,9vh,84px);flex:none}
+.hd .logo{width:clamp(48px,8vh,74px);height:clamp(44px,7.4vh,68px);flex:none}
+.t-SGP .hd .logo{background-image:var(--logo-sgp-f)} .t-FPT .hd .logo{background-image:var(--logo-fpt-f)}
+.hd .who{flex:1;min-width:0}
+.hd .code{font:400 clamp(26px,5vh,40px)/1 var(--f-display);color:var(--accent);padding-right:.2em;letter-spacing:.02em}
+.hd .name{font:700 11px/1.2 var(--f-label);letter-spacing:.3em;color:var(--mute);margin-top:4px;text-transform:uppercase}
+.hd .tm{min-width:84px;text-align:center;padding:6px 12px 4px;background:var(--violet);clip-path:polygon(10% 0,100% 0,90% 100%,0 100%)}
+.hd .tm .num{font-size:clamp(34px,6.4vh,52px);line-height:1;display:block}
+.hd .tm small{display:block;font:700 9px/1 var(--f-label);letter-spacing:.3em;margin-top:2px;text-indent:.3em}
+body.last .hd .tm{background:var(--fpt-lo);animation:pulse .5s ease-in-out infinite alternate}
+@keyframes pulse{to{transform:scale(1.07)}}
+.bar{height:6px;background:rgba(255,255,255,.12);flex:none;position:relative;overflow:hidden;clip-path:polygon(0 0,100% 0,99% 100%,0 100%)}
+.bar i{position:absolute;inset:0;background:var(--accent);transform-origin:left;transform:scaleX(0)}
+
+/* vùng chạm */
+.zone{position:relative;flex:1;min-height:0;overflow:hidden;color:var(--on);display:grid;place-items:center;text-align:center;
+  background:linear-gradient(160deg,var(--c1),var(--c2) 46%,var(--c3));
+  clip-path:polygon(0 0,100% 0,100% calc(100% - 7vw),calc(100% - 7vw) 100%,0 100%);
+  box-shadow:inset 0 0 0 3px rgba(255,255,255,.18);transition:filter .3s,transform .08s}
+.zone::before{content:"";position:absolute;inset:0;opacity:.13;background:center/62% no-repeat;pointer-events:none}
+.t-SGP .zone::before{background-image:var(--logo-sgp-b)} .t-FPT .zone::before{background-image:var(--logo-fpt-w)}
+.zone .in{position:relative;z-index:2;padding:0 4vw}
+.lbl{font:400 clamp(30px,10.5vw,72px)/1 var(--f-display);text-transform:uppercase;letter-spacing:.02em;padding-right:.15em}
+.cnt{display:block;font-size:min(46vw,27vh);line-height:.95;margin:1.2vh 0}
+.cnt.d3{font-size:min(36vw,22vh)} .cnt.d4{font-size:min(28vw,17vh)}
+.sub{font:700 clamp(12px,3.4vw,18px)/1.3 var(--f-label);letter-spacing:.28em;text-transform:uppercase;opacity:.8;text-indent:.28em}
+.zone .big{font:400 min(60vw,36vh)/1 var(--f-display);animation:pop .9s cubic-bezier(.2,1.4,.4,1) both}
+@keyframes pop{0%{transform:scale(1.7);opacity:0}25%{transform:scale(1);opacity:1}100%{transform:scale(.9);opacity:.9}}
+.rip{position:absolute;z-index:1;border-radius:50%;width:34vmin;height:34vmin;margin:-17vmin 0 0 -17vmin;background:var(--rip);animation:rip .42s ease-out forwards;pointer-events:none}
+@keyframes rip{from{transform:scale(.2);opacity:1}to{transform:scale(1.5);opacity:0}}
+.shake{animation:shake .25s}
+@keyframes shake{25%{transform:translateX(-8px)}75%{transform:translateX(8px)}}
+
+/* trạng thái theo pha */
+body[data-p="IDLE"] .zone,body[data-p="END"] .zone{filter:saturate(.7) brightness(.88)}
+body[data-p="RUN"] .zone{filter:none}
+body[data-p="RESULT"][data-r="LOSE"] .zone{filter:saturate(.25) brightness(.6)}
+body[data-p="RESULT"][data-r="WIN"] .zone{animation:win 1s ease-in-out infinite alternate}
+@keyframes win{to{filter:brightness(1.18) saturate(1.2)}}
+.v-cnt,.v-big,.v-idle,.v-end{display:none}
+body[data-p="IDLE"] .v-idle,body[data-p="COUNT"] .v-big,body[data-p="RUN"] .v-cnt,body[data-p="END"] .v-end,body[data-p="RESULT"] .v-end{display:block}
+
+/* nút SẴN SÀNG (tự bắt đầu lượt kế tiếp khi cả 2 pad cùng bấm) */
+.rbtn{display:none;margin:2.2vh auto 0;width:min(80vw,440px);min-height:clamp(84px,17vh,150px);border:0;cursor:pointer;padding:10px 18px;color:#fff;background:#0b0a2c;
+  clip-path:polygon(7% 0,100% 0,93% 100%,0 100%);position:relative;z-index:3;transition:background .15s,transform .08s}
+.rbtn:active{transform:scale(.97)}
+.rbtn .rb1{display:block;font:400 clamp(26px,9vw,52px)/1 var(--f-display);text-transform:uppercase;padding-right:.1em}
+.rbtn .rb2{display:block;margin-top:7px;font:700 clamp(10px,3vw,14px)/1.25 var(--f-label);letter-spacing:.18em;text-transform:uppercase;opacity:.85}
+.rbtn.on{background:var(--ok);color:#04230f;animation:rdy 1s ease-in-out infinite alternate}
+@keyframes rdy{to{filter:brightness(1.12)}}
+.rbtn[disabled]{opacity:.5;cursor:default}
+body[data-p="IDLE"] .rbtn,body[data-p="RESULT"] .rbtn{display:block}
+body.noauto .rbtn{display:none}
+body[data-p="RESULT"] .cnt.num{font-size:min(30vw,16vh)}
+body[data-p="RESULT"] .lbl{font-size:clamp(26px,9vw,60px)}
+
+/* footer */
+.ft{flex:none;display:flex;align-items:center;gap:10px;height:30px;font:700 11px/1 var(--f-label);letter-spacing:.14em;text-transform:uppercase;color:var(--mute)}
+.ft .dot{width:10px;height:10px;background:var(--ok);transform:skewX(-14deg);flex:none}
+body.offline .ft .dot{background:var(--warn)} body.offline .ft{color:var(--warn)}
+.ft .sp{flex:1}
+.ft .tally b{color:#fff;font:900 14px/1 var(--f-ui);letter-spacing:0}
+.ft .tally .a{color:var(--sgp)} .ft .tally .b{color:var(--fpt-hi)}
+</style>
+</head>
+<body data-p="IDLE" class="">
+<div id="pad" class="">
+  <div class="hd">
+    <div class="logo" role="img" aria-label="Logo đội"></div>
+    <div class="who"><div class="code" id="code">SGP</div><div class="name" id="name">SAIGON PHANTOM</div></div>
+    <div class="tm"><span class="num" id="tm">30</span><small>GIÂY</small></div>
+  </div>
+  <div class="bar" aria-hidden="true"><i id="bar"></i></div>
+
+  <div class="zone" id="zone" role="button" aria-label="Vùng chạm tính điểm">
+    <div class="in">
+      <div class="v-idle"><div class="lbl">Sẵn sàng chưa?</div><div class="sub" id="idleSub" style="margin-top:2vh">Cả hai bấm SẴN SÀNG để bắt đầu</div></div>
+      <div class="v-big"><div class="big" id="big">3</div><div class="sub" id="bigsub"></div></div>
+      <div class="v-cnt"><div class="lbl" id="l1">Chạm!</div><span class="cnt num" id="cnt">0</span><div class="sub" id="l2">Điểm của bạn</div></div>
+      <div class="v-end"><div class="lbl" id="l3">Hết giờ</div><span class="cnt num" id="cnt2">0</span><div class="sub" id="l4"></div></div>
+      <button class="rbtn" id="rbtn" type="button"><span class="rb1" id="rb1">SẴN SÀNG</span><span class="rb2" id="rb2"></span></button>
+    </div>
+  </div>
+
+  <div class="ft"><span class="dot"></span><span id="st">Đã kết nối</span><span class="sp"></span>
+    <span class="tally">TỔNG THẮNG <b class="a" id="ta">0</b> – <b class="b" id="tb">0</b></span></div>
+</div>
+<div class="conn">Mất kết nối · điểm vẫn được giữ trên máy</div>
+
+<script>
+(function () {
+  var A = AOG, $ = A.$, team = A.BOOT.team, key = A.BOOT.key || '', T = A.CFG.teams;
+  if (!T[team]) return;   // link thiếu/sai team → trang báo lỗi (xem BOOT của bản web)
+  var view = null, round = { id: '', count: 0, fin: false }, ready = false, rseq = 0;
+  var dirty = true, lastKick = null, lastSave = 0, fsTried = false, last = {};
+  var batt = { b: -1, c: 0 };
+  var other = team === 'SGP' ? 'FPT' : 'SGP';
+  function badLink(m) { lp && lp.stop && lp.stop(); document.body.innerHTML = '<div style="position:fixed;inset:0;display:grid;place-items:center;padding:24px;text-align:center;background:#0c0b2e;color:#fff;font:700 20px/1.5 sans-serif">' + m + '</div>'; }
+
+  document.body.className = 't-' + team; $('#pad').className = 't-' + team;
+  $('#code').textContent = team; $('#name').textContent = T[team].name;
+
+  try { navigator.getBattery().then(function (b) { function u() { batt.b = Math.round(b.level * 100); batt.c = b.charging ? 1 : 0; } u(); b.addEventListener('levelchange', u); b.addEventListener('chargingchange', u); }).catch(function () {}); } catch (e) {}
+
+  /* ---------- đồng bộ ---------- */
+  function ensureRound(v) {
+    var id = v.st.roundId;
+    if (v.st.phase === 'IDLE') { if (round.id) round = { id: '', count: 0, fin: false }; return; }
+    if (id !== round.id) {
+      round = { id: id, count: 0, fin: false };
+      var s = A.store('pad.' + team);               // khôi phục nếu tải lại trang giữa lượt
+      if (s && s.id === id) round.count = s.count || 0;
+    }
+  }
+  var lp = A.loop(function () {
+    var st = view && view.st;
+    if (st && st.phase === 'ROUND' && round.id === st.roundId && A.clock.now() >= st.endAt) round.fin = true;
+    return A.rpc('api_sync', { team: team, key: key, roundId: round.id, count: round.count, fin: round.fin, rdy: ready ? 1 : 0, rseq: rseq, b: batt.b, c: batt.c }, 7000)
+      .then(function (v) {
+        if (v && v.error === 'key') { badLink('Sai hoặc thiếu khóa “k” trong link pad – mở lại đúng link BTC cung cấp.'); }
+        if (!v || v.error) throw new Error(v && v.error || 'bad'); return v;
+      });
+  }, {
+    interval: function () { return view && view.st.phase === 'ROUND' ? 400 : 1100; },
+    onView: function (v) {
+      view = v; ensureRound(v);
+      if (v.st.phase === 'ROUND' || (ready && v.st.seq !== rseq)) ready = false;   // lượt mới bắt đầu → xóa trạng thái sẵn sàng
+      if (v.me && v.me.rid === v.st.roundId && round.id === v.st.roundId && v.me.n > round.count) { round.count = v.me.n; dirty = true; }
+      var t = Date.now(); if (round.id && t - lastSave > 700) { lastSave = t; A.store('pad.' + team, { id: round.id, count: round.count }); }
+      // đẩy điểm cuối ngay đúng lúc hết giờ
+      if (v.st.phase === 'ROUND') {
+        var sig = v.st.roundId; if (lastKick !== sig) { lastKick = sig; var ms = v.st.endAt - A.clock.now(); setTimeout(function () { lp.kick(); }, Math.max(0, ms + 40)); }
+      }
+    }
+  });
+  lp.start();
+
+  /* ---------- chạm ---------- */
+  function canTap() {
+    if (!view || view.st.phase !== 'ROUND' || round.id !== view.st.roundId) return false;
+    var t = A.clock.now(); return t >= view.st.startAt && t < view.st.endAt;
+  }
+  var zone = $('#zone'), nrip = 0;
+  function ripple(x, y) {
+    if (nrip > 7) return; nrip++;
+    var r = document.createElement('i'); r.className = 'rip';
+    var b = zone.getBoundingClientRect(); r.style.left = (x - b.left) + 'px'; r.style.top = (y - b.top) + 'px';
+    zone.appendChild(r); setTimeout(function () { r.remove(); nrip--; }, 430);
+  }
+  document.addEventListener('pointerdown', function (e) {
+    e.preventDefault();
+    if (!fsTried) { fsTried = true; A.fullscreen(); A.keepAwake(); }
+    if (canTap()) {
+      round.count++; dirty = true;
+      ripple(e.clientX, e.clientY);
+      zone.style.transform = 'scale(.988)'; requestAnimationFrame(function () { zone.style.transform = ''; });
+      if (navigator.vibrate) navigator.vibrate(4);
+    } else if (view && view.st.phase !== 'RESULT') {
+      zone.classList.remove('shake'); void zone.offsetWidth; zone.classList.add('shake');
+    }
+  }, { passive: false });
+  /* nút SẴN SÀNG: bấm để sẵn sàng, bấm lại để hủy */
+  var rb = $('#rbtn'), lastRb = 0;
+  function readyAllowed() {
+    if (!view || !(view.set && view.set.auto)) return false;
+    if (view.st.phase === 'IDLE') return true;
+    return view.st.phase === 'RESULT' && !!view.st.result && A.clock.now() >= view.st.result.at + (A.CFG.holdMs || 4000);
+  }
+  rb.addEventListener('pointerdown', function (e) {
+    e.preventDefault(); e.stopPropagation();
+    if (!fsTried) { fsTried = true; A.fullscreen(); A.keepAwake(); }
+    var n = Date.now(); if (n - lastRb < 350 || !readyAllowed()) return; lastRb = n;
+    ready = !ready; rseq = view.st.seq;
+    if (navigator.vibrate) navigator.vibrate(ready ? [12, 40, 12] : 6);
+    lp.kick();
+  }, { passive: false });
+  ['contextmenu', 'dblclick', 'selectstart', 'gesturestart', 'gesturechange', 'dragstart'].forEach(function (n) { document.addEventListener(n, function (e) { e.preventDefault(); }, { passive: false }); });
+  document.addEventListener('touchmove', function (e) { e.preventDefault(); }, { passive: false });
+  document.addEventListener('keydown', function (e) { if (e.key === 'F5' || (e.ctrlKey && e.key === 'r')) e.preventDefault(); });
+
+  /* ---------- hiển thị ---------- */
+  function setText(el, t) { if (el.textContent !== t) el.textContent = t; }
+  function set(el, t) { setText(el, t); }
+  function frame() {
+    requestAnimationFrame(frame);
+    if (!view) return;
+    var d = A.derive(view), st = view.st, r = null, rs = '';
+    // hết thời gian giữ kết quả → pad tự reset về 0 để sẵn sàng lượt mới
+    var fresh = d.p === 'RESULT' && !!st.result && A.clock.now() >= st.result.at + (A.CFG.holdMs || 4000);
+    if (fresh !== last.fresh) { last.fresh = fresh; dirty = true; }
+    if (d.p !== last.p) { last.p = d.p; document.body.setAttribute('data-p', d.p); dirty = true; }
+    if (d.p === 'RESULT' && st.result && !fresh) { var w = st.result.winner; r = w === 'DRAW' ? 'DRAW' : (w === team ? 'WIN' : 'LOSE'); }
+    if (r !== last.r) { last.r = r; if (r) document.body.setAttribute('data-r', r); else document.body.removeAttribute('data-r'); dirty = true; }
+
+    var cfg = view.set || { auto: true, duration: A.CFG.duration || 30 };
+    var secs = d.p === 'RUN' ? Math.ceil(d.ms / 1000) : (d.p === 'IDLE' || d.p === 'COUNT' ? (st.phase === 'ROUND' ? st.duration : cfg.duration) : 0);
+    set($('#tm'), String(secs));
+    document.body.classList.toggle('last', d.p === 'RUN' && d.ms <= 5000);
+    $('#bar').style.transform = 'scaleX(' + (d.p === 'RUN' ? Math.max(0, d.ms / (st.duration * 1000)) : 0) + ')';
+
+    if (d.p === 'COUNT') {
+      var c = d.ms > 3000 ? 'SẴN SÀNG' : String(Math.ceil(d.ms / 1000));
+      if (c !== last.c) { last.c = c; var b = $('#big'); b.textContent = c; b.style.fontSize = c === 'SẴN SÀNG' ? 'min(15vw,9vh)' : ''; b.style.animation = 'none'; void b.offsetWidth; b.style.animation = ''; set($('#bigsub'), c === 'SẴN SÀNG' ? 'Chuẩn bị chạm!' : 'Chạm ngay khi hết đếm!'); }
+    } else last.c = '';
+
+    if (dirty) {
+      dirty = false;
+      var n = String(round.id && st.phase !== 'IDLE' && !fresh ? round.count : 0), cls = 'cnt num' + (n.length === 3 ? ' d3' : n.length >= 4 ? ' d4' : '');
+      set($('#cnt'), n); $('#cnt').className = cls; set($('#cnt2'), n); $('#cnt2').className = cls;
+      var l3 = 'Hết giờ', l4 = 'Đang chốt điểm…';
+      if (fresh) { l3 = 'Lượt mới'; l4 = 'Điểm về 0 · bấm SẴN SÀNG'; }
+      else if (d.p === 'RESULT' && st.result) {
+        var o = st.result[other], m = st.result[team];
+        l3 = r === 'WIN' ? 'Thắng!' : r === 'LOSE' ? 'Thua rồi' : 'Hòa!';
+        l4 = team + ' ' + m + ' – ' + o + ' ' + other;
+      }
+      set($('#l3'), l3); set($('#l4'), l4);
+    }
+    document.body.classList.toggle('noauto', !cfg.auto);
+    setText($('#idleSub'), cfg.auto ? 'Cả hai bấm SẴN SÀNG để bắt đầu' : 'Chờ BTC bắt đầu');
+    if (cfg.auto && (d.p === 'IDLE' || d.p === 'RESULT')) {
+      var allowed = readyAllowed(), b1, b2, on = ready && allowed;
+      if (!allowed) { var left = d.p === 'RESULT' && st.result ? Math.ceil((st.result.at + (A.CFG.holdMs || 4000) - A.clock.now()) / 1000) : 0; b1 = 'Chờ chút…'; b2 = 'Sẵn sàng được sau ' + Math.max(1, left) + ' s'; }
+      else if (ready) { b1 = 'Đã sẵn sàng'; b2 = view.rd && view.rd[other] ? 'Đối thủ cũng sẵn sàng!' : 'Chờ đối thủ · chạm để hủy'; }
+      else { b1 = 'Sẵn sàng'; b2 = view.rd && view.rd[other] ? 'Đối thủ đã sẵn sàng!' : (d.p === 'RESULT' ? 'Bấm để chơi tiếp' : 'Bấm khi bạn đã sẵn sàng'); }
+      setText($('#rb1'), b1); setText($('#rb2'), b2);
+      rb.classList.toggle('on', on); rb.disabled = !allowed;
+    }
+    setText($('#st'), A.isOnline() ? 'Đã kết nối' : 'Mất kết nối – đang thử lại');
+    var s = view.stats; set($('#ta'), String(s.winsSGP)); set($('#tb'), String(s.winsFPT));
+  }
+  requestAnimationFrame(frame);
+  A.keepAwake();
+})();
+</script>
+</body>
+</html>
