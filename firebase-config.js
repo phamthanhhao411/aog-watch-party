@@ -9,5 +9,7 @@ window.AOG_FIREBASE = {
 };
 // (Tùy chọn) Link Google Sheet báo cáo để hiện trong trang Admin → Liên kết thiết bị
 window.AOG_SHEET_URL = 'https://docs.google.com/spreadsheets/d/1nRmN6s0gKsKalfLssdGkvtZZhy1IfS5aUKJl29Z2ybw/edit';
-// Web App Apps Script dùng để chép ngay kết quả sang Google Sheet sau mỗi lượt (fn=fbsync)
+// Web App Apps Script nhận kết quả sau mỗi lượt và ghi thẳng vào Google Sheet (fn=fbpush)
 window.AOG_SHEET_SYNC_URL = 'https://script.google.com/macros/s/AKfycby68hb5PWmAFfEerTlkA4jv8Q76UKw2C-Ref4dNfa6O1ADME5kJ3GVBE9k-M7r8o7yP/exec';
+// Phải trùng CONFIG.SHEET_PUSH_TOKEN trong Code.gs
+window.AOG_SHEET_PUSH_TOKEN = 'aog-036e7231b16f';
